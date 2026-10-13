@@ -77,47 +77,42 @@ async function chooseTemplate(prompt, keys) {
   } catch (e) { /* fall through to keywords */ }
   return loadTemplate(id || pickByKeywords(prompt));
 }
-const SYSTEM_TPL = `You are a professional web developer and copywriter. You customise a ready-made website template into the user's own website. Keep the template's design, layout, section order, CSS class names and working interactions; change the content, and the colours or fonts only when the user asks for it. Return valid structured JSON. Never include markdown code fences inside code fields.
-Rules: "html" is BODY INNER HTML only (no html, head, body or script tags). Keep semantic HTML, alt text, labels, one h1. Original content only, no copyrighted brands, no real phone numbers, addresses or emails (use obvious placeholders such as +91 00000 00000 or hello@example.com).`;
-function templateText(tpl, prompt, assets) {
-  return `Customise this ready-made website template ("${tpl.name}", category ${tpl.category}) for the request below.
-Request: ${prompt}
-
-How to customise:
-- Keep the structure: same sections in the same order (remove sections that do not fit the request, or add a new one in the same style if the request needs it), same CSS class names, same layout and the same working interactions.
-- Rewrite ALL visible text for the user's business: brand name, headings, taglines, descriptions, menu/service/product/course names, prices (realistic; use rupee signs if the request sounds Indian), testimonials (invented first names only), FAQ, opening hours, footer, page title text. Nothing from the template's original business may remain. Write in the language the user asked for, otherwise in English.
-- The template's JavaScript often holds content data (menus, products, plans, prices). If the content must change, return the complete JavaScript with the data and text updated and the logic untouched; if nothing needs to change return an empty string.
-- Colours and fonts: only if the user asks (or the business clearly needs a different mood), change them by returning extra CSS rules in "css", for example new values for the :root variables. "css" must contain ONLY these extra override rules (they are appended after the template CSS), or an empty string. Never return the whole template CSS.
-- Images: keep the template's existing <img src="https://images.unsplash.com/..."> URLs where they still fit the new business, and update their alt text. Never invent new image URLs.
-- Return ONE page (slug "/", name "Home") unless the user clearly asks for several pages. Extra pages must reuse the same header, footer and classes, use identical navigation links such as about.html, and have an empty javascript.
-- "name" is the website or brand name, "description" one sentence, "theme" the main colours (hex) and font family of the result.
-${assets && assets.length ? `- The user uploaded images, available at these exact paths: ${assets.join(', ')}. Use them with <img src="..." alt="..."> where they fit (for example logo, profile photo or hero) in place of template photos. Never redraw them or replace them with illustrations, and show them in their original colors: no filters, blend modes, overlays or reduced opacity.\n` : ''}
-=== TEMPLATE HTML (body inner) ===
-${tpl.html}
-=== TEMPLATE CSS (for reference only, do not return it) ===
-${tpl.css}
-=== TEMPLATE JAVASCRIPT ===
-${tpl.javascript || '(none)'}`;
+const SYSTEM_SLOTS = `You rewrite the text of a ready-made website template for a NEW business. The template's design, HTML, CSS and scripts are fixed and are never shown to you: you only rewrite texts. You get a list of items. Each item has an "id", "where" (the HTML element or attribute the text sits in, or "js" for text shown by the page scripts) and "t": an array of text fragments of ONE element. Fragments are split by inline tags such as <b>, so read them together as one sentence.
+Return JSON: name (business or brand name), tagline (max 8 words), description (one sentence), vars (optional list of {name,value} to recolour, see below) and items: for EVERY input item {id, t} with EXACTLY the same number of strings in t.
+Rules: write plain text only, no HTML tags, no markdown, no code. Same role and similar length as the original text (never much longer). Specific and natural, no lorem ipsum, nothing of the template's original business may remain. Keep very generic labels (Home, Menu, Close, Add, Next) and pure symbols or emoji icons unchanged, but change emoji that show the old business. Prices and numbers stay realistic (use rupee signs if the request sounds Indian). Never invent real phone numbers, emails or street addresses: use placeholders such as +91 00000 00000, hello@example.com, Your street, Your city. Write in the language the user asked for, otherwise in English.`;
+const SLOT_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    name: { type: 'STRING' }, tagline: { type: 'STRING' }, description: { type: 'STRING' },
+    vars: { type: 'ARRAY', items: { type: 'OBJECT', properties: { name: { type: 'STRING' }, value: { type: 'STRING' } }, required: ['name', 'value'] } },
+    items: { type: 'ARRAY', items: { type: 'OBJECT', properties: { id: { type: 'INTEGER' }, t: { type: 'ARRAY', items: { type: 'STRING' } } }, required: ['id', 't'] } },
+  },
+  required: ['name', 'items'],
+};
+function slotPrompt(tpl, prompt) {
+  const info = tc.slotInfo(tpl), rv = tc.rootVars(tpl);
+  const items = info.groups.map((g, id) => ({ id, where: g.tag, t: g.items.map((x) => x.text) }));
+  return `Customise the text of the template "${tpl.name}" (originally for: ${tpl.brand}; category ${tpl.category}) for this request.\nRequest: ${prompt}\n\n`
+    + `Colours: only if the user asks for specific colours or a clearly different mood, return "vars" with new hex values for some of these CSS colour variables (keep text readable on its background); otherwise return an empty vars list. Variables and current values: ${JSON.stringify(rv)}\n\nItems:\n${JSON.stringify(items)}`;
 }
-// Turns the AI's answer into the pages the app expects: template CSS + overrides, template JS unless the AI returned usable JS.
-function applyTemplate(parsed, tpl) {
-  const jsOk = (c) => { try { new Function(c); return true; } catch (e) { return false; } }; // syntax check only, nothing runs
-  const pages = (Array.isArray(parsed && parsed.pages) ? parsed.pages : []).map((p, i) => {
-    let html = String(p.html || '');
-    const b = html.match(/<body[^>]*>([\s\S]*)<\/body>/i);
-    if (b) html = b[1];
-    html = html.replace(/<script[\s\S]*?<\/script>/gi, '').trim();
-    let css = String(p.css || '').trim(), js = String(p.javascript || '').trim();
-    if (i === 0) {
-      const fonts = (tpl.css.match(/@import url\([^)]*\);\s*/g) || []).join('');
-      if (css.length > tpl.css.length * 0.7) css = (css.includes('@import') ? '' : fonts) + css; // the AI returned a full stylesheet: use it
-      else css = tpl.css + (css ? '\n/* customised */\n' + css : '');
-      if (!js || !jsOk(js)) js = tpl.javascript || '';
-    } else if (js && !jsOk(js)) js = '';
-    return { name: String(p.name || (i ? 'Page ' + (i + 1) : 'Home')), slug: String(p.slug || (i ? 'page-' + (i + 1) : '/')), html, css, javascript: js };
-  }).filter((p) => p.html.length > 200);
-  if (!pages.length) return null;
-  return { name: String(parsed.name || tpl.brand || 'My website'), description: String(parsed.description || ''), theme: parsed.theme && typeof parsed.theme === 'object' ? parsed.theme : {}, pages, template: tpl.id };
+// Gemini's answer -> finished site. Only texts come from the AI; HTML, CSS and scripts are the template's own.
+function slotsToSite(parsed, tpl, assets) {
+  const info = tc.slotInfo(tpl), texts = {};
+  let ok = 0;
+  for (const it of Array.isArray(parsed && parsed.items) ? parsed.items : []) {
+    const g = it && Number.isInteger(it.id) ? info.groups[it.id] : null;
+    if (!g || !Array.isArray(it.t) || !it.t.every((x) => typeof x === 'string')) continue;
+    const n = g.items.length;
+    let v = it.t.slice();
+    if (v.length > n) v = [...v.slice(0, n - 1), v.slice(n - 1).join(' ')];
+    while (v.length < n) v.push('');
+    if (!texts[it.id]) ok++;
+    texts[it.id] = v;
+  }
+  if (ok < info.n * 0.6) return null; // too much missing: the caller tries the next model
+  const vars = tc.cleanVars(tpl, Object.fromEntries((Array.isArray(parsed.vars) ? parsed.vars : []).filter((x) => x && typeof x.name === 'string').map((x) => [x.name, x.value])));
+  const out = tc.applyTexts(tpl, texts, { assets, vars });
+  return { name: String(parsed.name || tpl.brand || 'My website').slice(0, 60), description: String(parsed.description || '').slice(0, 200), theme: tc.themeOf(tpl, vars), pages: [{ name: 'Home', slug: '/', html: out.html, css: out.css, javascript: out.javascript }], template: tpl.id };
 }
 const hits = new Map(); // in-memory per-IP counter (resets on cold start); use Upstash/Firebase for strict limits
 // Env: GENERATE_LIMIT = abuse backstop per IP per day (default 100; the per-user limit of 5 is in index.html), EDIT_LIMIT = AI edits per IP per day (default 30)
@@ -487,7 +482,7 @@ async function handler(req, res) {
   }
   let tpl = null, pickMs = 0; // template mode: only normal Gemini generation without a reference image (backup AIs keep their own flow)
   if (mode === 'generate' && !image && backup !== true && keys.length) { const tp = Date.now(); tpl = await chooseTemplate(prompt, keys).catch(() => null); pickMs = Date.now() - tp; }
-  const text = tpl ? templateText(tpl, prompt, assets) : mode === 'generate'
+  const text = tpl ? slotPrompt(tpl, prompt) : mode === 'generate'
     ? `Create a complete multi-page-ready website (at least a Home page; add About/Contact etc. only if useful).\nRequest: ${prompt}` + (assets && assets.length ? `\nThe user uploaded images, available at these exact paths: ${assets.join(', ')}. Use them with <img src="..." alt="..."> where they fit (for example a profile photo, hero or logo). Never redraw, recreate or replace them with illustrations or SVG, and never invent other image files. Show them in their original colors: no grayscale, sepia, blur or brightness filters, no mix-blend-mode, no color overlays or reduced opacity on them.` : '')
     : `Existing site (name, theme, pages):\n${JSON.stringify(site)}\nCurrent page slug: ${page || '/'}\nRequested change: ${prompt}\nReturn ONLY pages that changed or are new (full code for each), plus a short summary of the change. If site.assets lists uploaded images, use them only by their exact path (for example <img src="assets/logo.webp" alt="...">) when the user asks to use their image, and never invent other image files. Show uploaded images in their original colors: do not add grayscale, sepia, blur or brightness filters, blend modes, color overlays or reduced opacity to them. Keep the design system and navigation consistent; if adding a page, also return the other pages with updated navigation.`;
 
@@ -500,12 +495,12 @@ async function handler(req, res) {
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': k },
     signal: AbortSignal.timeout(ms),
     body: JSON.stringify({
-      systemInstruction: { parts: [{ text: tpl ? SYSTEM_TPL : SYSTEM }] },
+      systemInstruction: { parts: [{ text: tpl ? SYSTEM_SLOTS : SYSTEM }] },
       contents: [{ role: 'user', parts: [
         { text: text + (image ? '\nAn image is attached. Analyze its layout, spacing, typography, colors, cards, buttons and sections and build a similar but ORIGINAL implementation. Do not copy logos, brand names, copyrighted assets or proprietary text.' : '') },
         ...(image ? [{ inlineData: { mimeType: image.mime, data: image.data } }] : []),
       ] }],
-      generationConfig: genConfig(model, SCHEMA[mode], lowThink),
+      generationConfig: genConfig(model, tpl ? SLOT_SCHEMA : SCHEMA[mode], lowThink),
     }),
   });
     // Newest Gemini models first (2.5 models now return 404 for new users). Duplicates removed.
@@ -534,7 +529,7 @@ async function handler(req, res) {
             const cand = data?.candidates?.[0];
             const out = (cand?.content?.parts || []).filter((p) => !p.thought).map((p) => p.text || '').join('');
             if (out) {
-              try { let parsed = JSON.parse(out.replace(/^```json|```$/g, '').trim()); if (tpl) { parsed = applyTemplate(parsed, tpl); if (!parsed) throw new Error('unusable template output'); } goodModel = m; return { parsed, via: 'gemini' }; }
+              try { let parsed = JSON.parse(out.replace(/^```json|```$/g, '').trim()); if (tpl) { parsed = slotsToSite(parsed, tpl, assets); if (!parsed) throw new Error('unusable template output'); } goodModel = m; return { parsed, via: 'gemini' }; }
               catch (e) { console.error('JSON parse failed', m, cand?.finishReason, out.slice(-200)); gnotes.push('parse-' + (cand?.finishReason || '')); }
             } else gnotes.push('empty-' + (cand?.finishReason || data?.promptFeedback?.blockReason || 'none'));
             last = { code: 502, body: { error: 'ai', why: 'unusable output' } };
@@ -598,4 +593,4 @@ async function handler(req, res) {
 module.exports = handler;
 module.exports.config = config;
 module.exports.backupStage = backupStage;
-module.exports.templates = { chooseTemplate, pickByKeywords, applyTemplate, loadTemplate, templateText };
+module.exports.templates = { chooseTemplate, pickByKeywords, slotsToSite, slotPrompt, loadTemplate };
