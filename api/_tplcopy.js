@@ -65,11 +65,15 @@ function buildSlots(tpl) {
     cur.items.push({ i, text: core, lead, trail });
   });
   close();
+  const attrVals = new Set(); // values of data-*, value, id ... attributes: scripts look these up, so equal JS strings stay unchanged
+  tokens.forEach((x) => { if (x.type === 'tag') for (const am of x.s.matchAll(/\s([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g)) if (!/^(alt|placeholder|title)$/i.test(am[1])) attrVals.add(decode(am[2] !== undefined ? am[2] : am[3]).trim()); });
   const lits = [], seen = new Set();
   const js = tpl.javascript || '';
+  const idents = new Set(); // words the script also uses as bare keys or properties ({Spanish:[...]}, obj.Spanish): never rename their quoted twins
+  for (const m of js.matchAll(/[{,]\s*([A-Za-z_$][\w$]*)\s*:|\.([A-Za-z_$][\w$]*)/g)) idents.add(m[1] || m[2]);
   js.replace(JS_LIT, (m, a, b, off) => {
     const s = a !== undefined ? a : b;
-    if (!seen.has(s) && jsOk(s, js, off)) { seen.add(s); lits.push(s); }
+    if (!seen.has(s) && jsOk(s, js, off) && !attrVals.has(s.trim()) && !idents.has(s.trim())) { seen.add(s); lits.push(s); }
     return m;
   });
   lits.forEach((s) => { if (hasText(s)) groups.push({ tag: 'js', items: [{ js: true, orig: s, text: s.trim().replace(/\s+/g, ' ') }] }); });
@@ -113,13 +117,15 @@ function themeOf(tpl, vars) {
 function applyTexts(tpl, texts, opt = {}) {
   const { tokens, groups } = buildSlots(tpl);
   const parts = tokens.map((t) => t.s), jsMap = new Map();
-  const clean = (s) => String(s).replace(/\s+/g, ' ').trim().slice(0, 500);
+  const clean = (s) => decode(String(s).replace(/<[^>]*>/g, ' ').replace(/```[a-z]*|`|\*\*|__/g, '')).replace(/\s+/g, ' ').trim().slice(0, 500); // plain text only: tags, markdown and entities from the AI never show up as code
+  const same = new Map(); // original text -> first new text
   groups.forEach((g, id) => {
     const arr = texts && texts[id];
     if (!Array.isArray(arr)) return;
     g.items.forEach((it, k) => {
       if (typeof arr[k] !== 'string') return;
-      const nv = clean(arr[k]);
+      let nv = clean(arr[k]);
+      if (same.has(it.text)) nv = same.get(it.text); else same.set(it.text, nv);
       if (it.js) { if (nv) jsMap.set(it.orig, (it.orig.match(/^\s*/)[0] + nv.replace(/[<>]/g, '') + it.orig.match(/\s*$/)[0])); }
       else if (it.attr) parts[it.i] = parts[it.i].replace(new RegExp('(\\s' + it.attr + '\\s*=\\s*)(?:"[^"]*"|\'[^\']*\')', 'i'), (m, p) => p + '"' + escAttr(nv) + '"');
       else parts[it.i] = it.lead + escText(nv) + it.trail;
