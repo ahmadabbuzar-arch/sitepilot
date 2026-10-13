@@ -26,21 +26,15 @@ const genConfig = (model, schema, lowThink) => ({ responseMimeType: 'application
 // Gemini keys in order of use: GEMINI_API_KEY, then GEMINI_API_KEY_2 (also accepts _2 variants, _BACKUP, or a comma list in GEMINI_API_KEYS)
 const geminiKeys = () => [...new Set(['GEMINI_API_KEY', 'GEMINI_API_KEY_2', 'GEMINI_API_KEY2', 'GEMINI_API_KEY_BACKUP', 'GEMINI_API_KEY_B'].map((n) => process.env[n]).concat((process.env.GEMINI_API_KEYS || '').split(',')).map((x) => (x || '').trim()).filter(Boolean))];
 const kit = require('./_kit.js');
+const tc = require('./_tplcopy.js'); // text-slot engine: backup AIs customise the 100 templates by rewriting their text only
 
-// ---------- Ready-made templates (api/_templates, built by scripts/build-templates.py) ----------
+// ---------- Ready-made templates (api/_templates.js, built by scripts/build-templates.py) ----------
 // generate mode: the AI first picks the closest of the 100 templates, then rewrites its content for the user's request
 // (the template's layout, CSS and JavaScript are kept). If anything here fails, the normal from-scratch generation runs.
-const fs = require('fs'), path = require('path');
-const TPL_DIR = path.join(__dirname, '_templates');
-let tplCatalog = null;
-function templateCatalog() {
-  if (!tplCatalog) { try { tplCatalog = JSON.parse(fs.readFileSync(path.join(TPL_DIR, 'catalog.json'), 'utf8')); } catch (e) { tplCatalog = []; } }
-  return tplCatalog;
-}
-function loadTemplate(id) {
-  if (typeof id !== 'string' || !/^[a-z0-9-]+--[a-z0-9-]+$/.test(id)) return null;
-  try { return JSON.parse(fs.readFileSync(path.join(TPL_DIR, id + '.json'), 'utf8')); } catch (e) { return null; }
-}
+let tplData = null; // loaded on first use: one file with all 100 templates (api/_templates.js)
+const tplAll = () => { if (!tplData) { try { tplData = require('./_templates.js'); } catch (e) { tplData = { catalog: [], templates: {} }; } } return tplData; };
+const templateCatalog = () => tplAll().catalog;
+const loadTemplate = (id) => (typeof id === 'string' && Object.prototype.hasOwnProperty.call(tplAll().templates, id) ? tplAll().templates[id] : null);
 // Fallback when the AI pick fails (or for English prompts it is enough): count template names/tags found in the request.
 function pickByKeywords(prompt) {
   const q = String(prompt).toLowerCase(), wantsDash = /dashboard|admin|panel|crm|erp|management (system|software)/.test(q);
@@ -54,7 +48,7 @@ function pickByKeywords(prompt) {
     }
     if (sc > bestScore) { bestScore = sc; best = t.id; }
   }
-  return best || 'business--startup-company';
+  return bestScore >= 3 ? best : 'business--startup-company'; // a weak match is worse than a neutral business template
 }
 const PICK_SCHEMA = { type: 'OBJECT', properties: { id: { type: 'STRING' } }, required: ['id'] };
 async function chooseTemplate(prompt, keys) {
@@ -254,6 +248,69 @@ async function aiJson(sys, user, maxTokens, opt = {}) {
 async function backupStage(stage, b, opt) {
   const clip = (v, n) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim().slice(0, n);
   const assets = (Array.isArray(b.assets) ? b.assets : []).filter((a) => typeof a === 'string' && /^assets\/[a-z0-9._-]{1,70}$/.test(a)).slice(0, 12);
+  // ---- Template flow for the backup AIs (replaces the old kit flow): tplplan -> tplcopy (several batches) -> tplbuild ----
+  if (stage === 'tplplan') {
+    const cat = templateCatalog();
+    if (!cat.length) return { notemplates: true }; // templates folder missing: the app falls back to the old kit flow
+    const prompt = String(b.prompt || '');
+    const list = cat.map((t) => t.id + ' | ' + t.tags.join(', ')).join('\n');
+    const sys = 'You are a creative director. Pick the best ready-made website template for the user request (the request can be in any language, also Hindi or Hinglish) and plan the branding. Return ONLY one JSON object: {"template":"id","name":"brand or business name","tagline":"max 8 words","description":"1 sentence","tone":"2-4 words","language":"language the website text must be written in (English unless the user asked for another)"}. '
+      + '"template" must be EXACTLY one id from this list (id | tags). Match the business type first; use admin-dashboard templates only when the user asks for a dashboard, admin panel or management software; if nothing fits, take the closest generic one.\n' + list;
+    const g = await aiJson(sys, `Website request: ${clip(prompt, 1500)}`, 900, { ...opt, stage: 'plan' });
+    const raw = g && g.data && typeof g.data === 'object' ? g.data : null;
+    if (!raw) return null;
+    const ids = new Set(cat.map((t) => t.id));
+    const tpl = loadTemplate(ids.has(raw.template) ? raw.template : pickByKeywords(prompt));
+    if (!tpl) return null;
+    let vars = {};
+    if (/colou?r|rang\b|theme|dark|black|white|blue|red|green|yellow|orange|pink|purple|violet|gold|brown|teal|navy|maroon|neon|pastel|#[0-9a-f]{3,6}|नीला|लाल|हरा|काला/i.test(prompt)) { // recolour only when the user talks about colours
+      const rv = tc.rootVars(tpl);
+      if (Object.keys(rv).length) {
+        const g2 = await aiJson('Return ONLY JSON {"vars":{"--name":"#rrggbb"}}. Change only the CSS colour variables needed to give this website the colours or mood the user asked for, and keep text readable on its background. Allowed variables with their current values: ' + JSON.stringify(rv), `Website request: ${clip(prompt, 800)}`, 600, { ...opt, stage: 'plan' });
+        if (g2 && g2.data) vars = tc.cleanVars(tpl, g2.data.vars);
+      }
+    }
+    const info = tc.slotInfo(tpl);
+    return { template: tpl.id, name: clip(raw.name, 60) || tpl.brand || 'My website', tagline: clip(raw.tagline, 80), description: clip(raw.description, 200), tone: clip(raw.tone, 40), language: clip(raw.language, 30) || 'English', vars, theme: tc.themeOf(tpl, vars), groups: info.n, batches: info.batches.length, by: g.by };
+  }
+  if (stage === 'tplcopy') {
+    const tpl = loadTemplate(b.template);
+    if (!tpl) return null;
+    const info = tc.slotInfo(tpl), k = Number.isInteger(b.batch) ? b.batch : -1;
+    if (k < 0 || k >= info.batches.length) return null;
+    const br = b.brief && typeof b.brief === 'object' ? b.brief : {};
+    const ids = info.batches[k], payload = {};
+    ids.forEach((id) => { payload[id + '|' + info.groups[id].tag] = info.groups[id].items.map((x) => x.text); });
+    const sys = 'You rewrite the text of a ready-made website template for a NEW business. You get a JSON object. Each key is "id|where" (where = the HTML element or attribute, or "js" for text that the page scripts show) and each value is an array of text fragments that belong to ONE element; fragments are split by inline tags such as <b>, so read them together as one sentence. '
+      + 'Return ONLY a JSON object with EXACTLY the same keys, each value an array with EXACTLY the same number of strings. '
+      + `The template was originally made for: ${tpl.name} (${tpl.brand}). Rewrite every string for the new business below: same role and similar length (never much longer), specific and natural, no lorem ipsum, nothing of the original business may remain. `
+      + 'Keep very generic labels (Home, Menu, Close, Add, Next) and pure symbols or emoji icons as they are, but change emoji that show the old business. Prices and numbers stay realistic (use rupee signs if the request sounds Indian). Never invent real phone numbers, emails or street addresses: use placeholders such as +91 00000 00000, hello@example.com, Your street, Your city. '
+      + `Write in ${clip(br.language, 30) || 'English'}.`;
+    const user = `Business: ${clip(br.name, 60)}. Tagline: ${clip(br.tagline, 80)}. About: ${clip(br.description, 200)}. Tone: ${clip(br.tone, 40) || 'confident and friendly'}. Original request: ${clip(b.prompt, 800)}\n\nTexts to rewrite:\n${JSON.stringify(payload)}`;
+    const g = await aiJson(sys, user, 3800, { ...opt, stage: 'page' });
+    const raw = g && g.data;
+    if (!raw || typeof raw !== 'object') return null;
+    const texts = {};
+    let ok = 0;
+    ids.forEach((id) => {
+      const n = info.groups[id].items.length;
+      const key = Object.keys(raw).find((x) => x === id + '|' + info.groups[id].tag) || Object.keys(raw).find((x) => x.split('|')[0] === String(id));
+      let v = key ? raw[key] : undefined;
+      if (typeof v === 'string') v = [v];
+      if (!Array.isArray(v) || !v.length || !v.every((x) => typeof x === 'string')) return;
+      if (v.length > n) v = [...v.slice(0, n - 1), v.slice(n - 1).join(' ')];
+      while (v.length < n) v.push('');
+      texts[id] = v.map((x) => clip(x, 500));
+      ok++;
+    });
+    if (ok < ids.length * 0.7) return null; // too much missing: let the app try this batch again
+    return { texts, by: g.by };
+  }
+  if (stage === 'tplbuild') { // no AI here: puts the rewritten texts into the template
+    const tpl = loadTemplate(b.template);
+    if (!tpl || !b.texts || typeof b.texts !== 'object' || JSON.stringify(b.texts).length > 300000) return null;
+    return { ...tc.applyTexts(tpl, b.texts, { assets, vars: b.vars }), by: 'template' };
+  }
   if (stage === 'plan') {
     const short = kit.shortlist(String(b.prompt || ''));
     const sys = 'You are a senior creative director and information architect at a top web agency. Plan a premium website for the request. Return ONLY one JSON object: {"name":"","tagline":"max 8 words","description":"1 sentence","preset":"id","brandColor":"#hex or empty","contactEmail":"only if the user wrote one, else empty","tone":"2-4 words","navCta":{"label":"max 3 words","target":"contact"},"pages":[{"name":"Home","slug":"/","sections":[{"type":"hero","label":"Home"}]}]}.\n'
@@ -421,11 +478,11 @@ async function handler(req, res) {
     return res.status(200).json(out);
   }
   if (backup === true && stage && mode === 'generate' && haveBackup()) { // staged backup build (see backupStage)
-    if (!['plan', 'page'].includes(stage)) return res.status(400).json({ error: 'input' });
+    if (!['plan', 'page', 'tplplan', 'tplcopy', 'tplbuild'].includes(stage)) return res.status(400).json({ error: 'input' });
     const nm = (v) => (typeof v === 'string' && PROVIDERS[v] ? v : undefined);
     const out = await backupStage(stage, req.body, { prefer: nm(req.body.prefer), avoid: nm(req.body.avoid), slot: Number.isInteger(req.body.slot) && req.body.slot > 0 && req.body.slot < 10 ? req.body.slot : 0, deadline: Date.now() + 52000 });
     if (!out) return res.status(503).json({ error: 'busy' });
-    if (stage === 'plan') hits.set(k, used + 1); // one website = one count
+    if (stage === 'plan' || stage === 'tplplan') hits.set(k, used + 1); // one website = one count
     return res.status(200).json({ ...out, via: out.by || 'backup' });
   }
   let tpl = null, pickMs = 0; // template mode: only normal Gemini generation without a reference image (backup AIs keep their own flow)
@@ -540,4 +597,5 @@ async function handler(req, res) {
 
 module.exports = handler;
 module.exports.config = config;
+module.exports.backupStage = backupStage;
 module.exports.templates = { chooseTemplate, pickByKeywords, applyTemplate, loadTemplate, templateText };
