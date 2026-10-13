@@ -239,7 +239,20 @@ pg.busy=false;render()}
 const usePrompt=()=>{const e=$('#po');window._pr=(e?e.value:pg.out).trim();view='home';render()};
 const copyPrompt=()=>{const e=$('#po'),t=e?e.value:pg.out;navigator.clipboard.writeText(t).then(()=>showToast('Prompt copied'),()=>window.prompt('Copy this prompt',t))};
 const classList=css=>[...new Set((css.match(/\.[a-zA-Z][\w-]*/g)||[]).map(x=>x.slice(1)))].slice(0,110);
-async function stagedBackup(prompt,assetNames){ // backup AIs write the plan and the content in steps; the SitePilot Kit on the server supplies the polished design
+async function stagedBackup(prompt,assetNames){ // backup AIs pick one of the 100 templates and rewrite its text in steps; the template supplies the design
+const S=['Choosing a template','Writing your content','Finishing'];let prog=0;
+const stage=async body=>{for(let t=0;;t++){try{return await api({mode:'generate',prompt,assets:assetNames.length?assetNames:undefined,backup:true,...body})}catch(e){if(e==='limit'||t>=3)throw e;setBusy(S,prog,'The AI is rate-limited. Waiting a moment, then trying again...');await new Promise(r=>setTimeout(r,20000))}}};
+setBusy(S,0,'The backup AIs customise a ready-made template for you. This can take a few minutes.');
+const plan=await stage({stage:'tplplan'});
+if(plan.notemplates)return stagedBackupKit(prompt,assetNames);
+prog=1;setBusy(S,1,'Writing the content for your website with several AIs working together...');
+const brief={name:plan.name,tagline:plan.tagline,description:plan.description,tone:plan.tone,language:plan.language};
+const texts={};
+for(let k=0;k<plan.batches;k+=3){const part=await Promise.all([0,1,2].filter(j=>k+j<plan.batches).map(j=>stage({stage:'tplcopy',template:plan.template,brief,batch:k+j,slot:k+j})));part.forEach(r=>Object.assign(texts,r.texts))}
+prog=2;setBusy(S,2,'Almost done...');
+const out=await stage({stage:'tplbuild',template:plan.template,texts,vars:plan.vars,brief});
+return{name:plan.name,description:plan.description,theme:plan.theme,pages:[{name:'Home',slug:'/',html:out.html,css:out.css,javascript:out.javascript||''}],template:plan.template,via:'backup'}}
+async function stagedBackupKit(prompt,assetNames){ // old flow (only used if the templates folder is missing on the server): the SitePilot Kit supplies the design
 const S=['Planning','Writing pages','Finishing'];let prog=0;
 const stage=async body=>{for(let t=0;;t++){try{return await api({mode:'generate',prompt,assets:assetNames.length?assetNames:undefined,backup:true,...body})}catch(e){if(e==='limit'||t>=3)throw e;setBusy(S,prog,'The AI is rate-limited. Waiting a moment, then trying again...');await new Promise(r=>setTimeout(r,20000))}}};
 setBusy(S,0,'The backup AIs build your site in steps. This can take a few minutes.');
