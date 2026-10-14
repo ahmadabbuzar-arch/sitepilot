@@ -50,7 +50,7 @@ function pickByKeywords(prompt) {
   }
   return bestScore >= 3 ? best : 'business--startup-company'; // a weak match is worse than a neutral business template
 }
-const PICK_SCHEMA = { type: 'OBJECT', properties: { id: { type: 'STRING' } }, required: ['id'] };
+const PICK_SCHEMA = { type: 'OBJECT', properties: { ids: { type: 'ARRAY', items: { type: 'STRING' } } }, required: ['ids'] };
 async function chooseTemplate(prompt, keys) {
   const cat = templateCatalog();
   if (!cat.length) return null;
@@ -63,7 +63,7 @@ async function chooseTemplate(prompt, keys) {
     const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': keys[0] }, signal: AbortSignal.timeout(6000),
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: 'You pick the best ready-made website template for a user request. The request can be in any language (Hindi, Hinglish, English...). Answer with JSON {"id":"..."} using EXACTLY one id from the list. Match the business or purpose first. Use admin-dashboard templates only if the user asks for a dashboard, admin panel or management software. If nothing fits well, choose the closest generic one (for example a business--, landing-pages-- or portfolio-- template).' }] },
+        systemInstruction: { parts: [{ text: 'You pick the best ready-made website template for a user request. The request can be in any language (Hindi, Hinglish, English...). Answer with JSON {"ids":["..."]}: up to 3 ids from the list that are genuinely good fits, best first (only one id if only one really fits). Match the business or purpose first. Use admin-dashboard templates only if the user asks for a dashboard, admin panel or management software. If nothing fits well, choose the closest generic one (for example a business--, landing-pages-- or portfolio-- template).' }] },
         contents: [{ role: 'user', parts: [{ text: 'Templates (id | tags):\n' + list + '\n\nUser request: ' + prompt.slice(0, 600) }] }],
         generationConfig: { responseMimeType: 'application/json', responseSchema: PICK_SCHEMA, maxOutputTokens: 200, ...(/2\.5/.test(model) ? { thinkingConfig: { thinkingBudget: 0 } } : { thinkingConfig: { thinkingLevel: 'low' } }) },
       }),
@@ -72,18 +72,25 @@ async function chooseTemplate(prompt, keys) {
       const j = await r.json();
       const txt = (((j.candidates || [])[0] || {}).content || {}).parts || [];
       const got = JSON.parse(txt.filter((x) => !x.thought).map((x) => x.text || '').join('').replace(/^```json|```$/g, '').trim());
-      if (got && ids.has(got.id)) id = got.id;
+      const good = (Array.isArray(got && got.ids) ? got.ids : []).filter((x) => ids.has(x)).slice(0, 3);
+      if (good.length) id = randOf(good); // several good fits: a random one, so users with the same idea do not all get the same site
     }
   } catch (e) { /* fall through to keywords */ }
   return loadTemplate(id || pickByKeywords(prompt));
 }
+// Every site gets its own look: a random creative direction, a fresh palette and a font pair, so two users asking for the same business do not get the same site.
+const MOODS = ['bold and high-contrast', 'soft and pastel', 'dark and premium', 'fresh and bright', 'earthy and natural', 'playful and colourful', 'minimal black and white with one strong accent', 'warm and cozy', 'sporty and energetic', 'elegant and luxurious', 'retro and vintage', 'techy with neon accents', 'calm and trustworthy', 'trendy gradient-like pink, purple and blue'];
+const randOf = (a) => a[Math.floor(Math.random() * a.length)];
+const fontList = () => tc.FONT_PAIRS.map((f) => `${f.id} (${f.mood})`).join(', ');
+const PALETTE_RULE = 'ALWAYS give this site its own fresh palette. Unless the user named colours, invent one that suits the brand and the creative direction and clearly differs from the template\'s current colours (a different main hue, not a small tweak). Return new hex values for the accent/brand colours and, when it suits the direction, for background, surface and text colours too, as one matching palette (not a single colour). Text must stay easy to read: strong contrast between text and its background, and accent colours that carry white text (buttons, hero) must be deep or saturated enough for white text.';
+
 const SYSTEM_SLOTS = `You rewrite the text of a ready-made website template for a NEW business. The template's design, HTML, CSS and scripts are fixed and are never shown to you: you only rewrite texts. You get a list of items. Each item has an "id", "where" (the HTML element or attribute the text sits in, or "js" for text shown by the page scripts) and "t": an array of text fragments of ONE element. Fragments are split by inline tags such as <b>, so read them together as one sentence.
-Return JSON: name (business or brand name), tagline (max 8 words), description (one sentence), vars (optional list of {name,value} to recolour, see below) and items: for EVERY input item {id, t} with EXACTLY the same number of strings in t.
+Return JSON: name (business or brand name), tagline (max 8 words), description (one sentence), font (one font id from the list below), vars (list of {name,value}: the new colour palette, see below) and items: for EVERY input item {id, t} with EXACTLY the same number of strings in t.
 Rules: write plain text only, no HTML tags, no markdown, no code. Same role and similar length as the original text (never much longer). Specific and natural, no lorem ipsum, nothing of the template's original business may remain. Keep very generic labels (Home, Menu, Close, Add, Next) and pure symbols or emoji icons unchanged, but change emoji that show the old business. Prices and numbers stay realistic (use rupee signs if the request sounds Indian). Never invent real phone numbers, emails or street addresses: use placeholders such as +91 00000 00000, hello@example.com, Your street, Your city. Write in the language the user asked for, otherwise in English.`;
 const SLOT_SCHEMA = {
   type: 'OBJECT',
   properties: {
-    name: { type: 'STRING' }, tagline: { type: 'STRING' }, description: { type: 'STRING' },
+    name: { type: 'STRING' }, tagline: { type: 'STRING' }, description: { type: 'STRING' }, font: { type: 'STRING' },
     vars: { type: 'ARRAY', items: { type: 'OBJECT', properties: { name: { type: 'STRING' }, value: { type: 'STRING' } }, required: ['name', 'value'] } },
     items: { type: 'ARRAY', items: { type: 'OBJECT', properties: { id: { type: 'INTEGER' }, t: { type: 'ARRAY', items: { type: 'STRING' } } }, required: ['id', 't'] } },
   },
@@ -93,7 +100,9 @@ function slotPrompt(tpl, prompt) {
   const info = tc.slotInfo(tpl), rv = tc.rootVars(tpl);
   const items = info.groups.map((g, id) => ({ id, where: g.tag, t: g.items.map((x) => x.text) }));
   return `Customise the text of the template "${tpl.name}" (originally for: ${tpl.brand}; category ${tpl.category}) for this request.\nRequest: ${prompt}\n\n`
-    + `Colours: only if the user asks for specific colours or a clearly different mood, return "vars" with new hex values for some of these CSS colour variables (keep text readable on its background); otherwise return an empty vars list. Variables and current values: ${JSON.stringify(rv)}\n\nItems:\n${JSON.stringify(items)}`;
+    + `Creative direction for this site (follow it unless the user asked for something else): ${randOf(MOODS)}.\n`
+    + `Colours: ${PALETTE_RULE} Colour variables of this template and their current values: ${JSON.stringify(rv)}\n`
+    + `Font: choose ONE id that fits the brand and direction: ${fontList()}.\n\nItems:\n${JSON.stringify(items)}`;
 }
 // Gemini's answer -> finished site. Only texts come from the AI; HTML, CSS and scripts are the template's own.
 function slotsToSite(parsed, tpl, assets) {
@@ -111,7 +120,8 @@ function slotsToSite(parsed, tpl, assets) {
   }
   if (ok < info.n * 0.6) return null; // too much missing: the caller tries the next model
   const vars = tc.cleanVars(tpl, Object.fromEntries((Array.isArray(parsed.vars) ? parsed.vars : []).filter((x) => x && typeof x.name === 'string').map((x) => [x.name, x.value])));
-  const out = tc.applyTexts(tpl, texts, { assets, vars });
+  const font = tc.fontById(String(parsed.font || '').trim()) ? String(parsed.font).trim() : tc.FONT_PAIRS[Math.floor(Math.random() * tc.FONT_PAIRS.length)].id;
+  const out = tc.applyTexts(tpl, texts, { assets, vars, font });
   return { name: String(parsed.name || tpl.brand || 'My website').slice(0, 60), description: String(parsed.description || '').slice(0, 200), theme: tc.themeOf(tpl, vars), pages: [{ name: 'Home', slug: '/', html: out.html, css: out.css, javascript: out.javascript }], template: tpl.id };
 }
 const hits = new Map(); // in-memory per-IP counter (resets on cold start); use Upstash/Firebase for strict limits
@@ -249,22 +259,22 @@ async function backupStage(stage, b, opt) {
     if (!cat.length) return { notemplates: true }; // templates folder missing: the app falls back to the old kit flow
     const prompt = String(b.prompt || '');
     const list = cat.map((t) => t.id + ' | ' + t.tags.join(', ')).join('\n');
-    const sys = 'You are a creative director. Pick the best ready-made website template for the user request (the request can be in any language, also Hindi or Hinglish) and plan the branding. Return ONLY one JSON object: {"template":"id","name":"brand or business name","tagline":"max 8 words","description":"1 sentence","tone":"2-4 words","language":"language the website text must be written in (English unless the user asked for another)"}. '
-      + '"template" must be EXACTLY one id from this list (id | tags). Match the business type first; use admin-dashboard templates only when the user asks for a dashboard, admin panel or management software; if nothing fits, take the closest generic one.\n' + list;
+    const sys = 'You are a creative director. Pick the best ready-made website template for the user request (the request can be in any language, also Hindi or Hinglish) and plan the branding. Return ONLY one JSON object: {"templates":["id"],"name":"brand or business name","tagline":"max 8 words","description":"1 sentence","tone":"2-4 words","language":"language the website text must be written in (English unless the user asked for another)"}. '
+      + '"templates" lists up to 3 ids from this list (id | tags) that are genuinely good fits, best first (one id if only one really fits). Match the business type first; use admin-dashboard templates only when the user asks for a dashboard, admin panel or management software; if nothing fits, take the closest generic one.\n' + list;
     const g = await aiJson(sys, `Website request: ${clip(prompt, 1500)}`, 900, { ...opt, stage: 'plan' });
     const raw = g && g.data && typeof g.data === 'object' ? g.data : null;
     if (!raw) return null;
     const ids = new Set(cat.map((t) => t.id));
-    const tpl = loadTemplate(ids.has(raw.template) ? raw.template : pickByKeywords(prompt));
+    const good = (Array.isArray(raw.templates) ? raw.templates : [raw.template]).filter((x) => ids.has(x)).slice(0, 3);
+    const tpl = loadTemplate(good.length ? randOf(good) : pickByKeywords(prompt));
     if (!tpl) return null;
-    let vars = {};
-    if (/colou?r|rang\b|theme|dark|black|white|blue|red|green|yellow|orange|pink|purple|violet|gold|brown|teal|navy|maroon|neon|pastel|#[0-9a-f]{3,6}|नीला|लाल|हरा|काला/i.test(prompt)) { // recolour only when the user talks about colours
+    let vars = {}, font = null;
+    { // every site gets a fresh palette and a font pair (not only when the user names colours)
       const rv = tc.rootVars(tpl);
-      if (Object.keys(rv).length) {
-        const g2 = await aiJson('Return ONLY JSON {"vars":{"--name":"#rrggbb"}}. Change only the CSS colour variables needed to give this website the colours or mood the user asked for, and keep text readable on its background. Allowed variables with their current values: ' + JSON.stringify(rv), `Website request: ${clip(prompt, 800)}`, 600, { ...opt, stage: 'plan' });
-        if (g2 && g2.data) vars = tc.cleanVars(tpl, g2.data.vars);
-      }
+      const g2 = await aiJson('Return ONLY JSON {"vars":{"--name":"#rrggbb"},"font":"id"}. ' + PALETTE_RULE + ' Allowed colour variables with their current values: ' + JSON.stringify(rv) + '. "font" = ONE id that fits the brand and direction: ' + fontList() + '.', `Website request: ${clip(prompt, 800)}\nCreative direction: ${randOf(MOODS)}.`, 700, { ...opt, stage: 'plan' });
+      if (g2 && g2.data) { vars = tc.cleanVars(tpl, g2.data.vars); font = tc.fontById(String(g2.data.font || '').trim()) ? String(g2.data.font).trim() : null; }
     }
+    vars['--font'] = font || randOf(tc.FONT_PAIRS).id; // travels with vars to the build step (not a CSS variable)
     const info = tc.slotInfo(tpl);
     return { template: tpl.id, name: clip(raw.name, 60) || tpl.brand || 'My website', tagline: clip(raw.tagline, 80), description: clip(raw.description, 200), tone: clip(raw.tone, 40), language: clip(raw.language, 30) || 'English', vars, theme: tc.themeOf(tpl, vars), groups: info.n, batches: info.batches.length, by: g.by };
   }
