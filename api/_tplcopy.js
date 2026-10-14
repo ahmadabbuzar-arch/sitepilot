@@ -105,12 +105,69 @@ function rootVars(tpl) {
 function cleanVars(tpl, vars) {
   const allowed = rootVars(tpl), out = {};
   if (vars && typeof vars === 'object') for (const [k, v] of Object.entries(vars)) if (allowed[k] && /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(String(v))) out[k] = String(v);
-  return out;
+  return guardVars(tpl, out);
 }
 function themeOf(tpl, vars) {
   const v = { ...rootVars(tpl), ...cleanVars(tpl, vars) }, names = Object.keys(v);
   const pick = (re, d) => { const n = names.find((x) => re.test(x)); return n ? v[n] : d; };
   return { primaryColor: pick(/^--(pr|primary|ac|accent|br|brand)/i, v[names[0]] || '#2563eb'), backgroundColor: pick(/^--(bg|background|paper|white|surface)/i, '#ffffff'), textColor: pick(/^--(tx|text|ink|fg)/i, '#111111'), fontFamily: 'system-ui, sans-serif' };
+}
+
+// ---- Look variety: every site gets its own palette and font pair on top of the template ----
+const FONT_PAIRS = [
+  { id: 'elegant', mood: 'elegant, premium', h: ['Playfair Display', 'wght@500;700'], b: ['Inter', 'wght@400;600'], hf: 'serif', bf: 'sans-serif' },
+  { id: 'modern', mood: 'modern, friendly', h: ['Poppins', 'wght@600;700'], b: ['Poppins', 'wght@400;500'], hf: 'sans-serif', bf: 'sans-serif' },
+  { id: 'tech', mood: 'techy, sharp', h: ['Space Grotesk', 'wght@500;700'], b: ['Inter', 'wght@400;600'], hf: 'sans-serif', bf: 'sans-serif' },
+  { id: 'editorial', mood: 'editorial, stylish', h: ['DM Serif Display', ''], b: ['DM Sans', 'wght@400;500;700'], hf: 'serif', bf: 'sans-serif' },
+  { id: 'clean', mood: 'clean, corporate', h: ['Montserrat', 'wght@600;800'], b: ['Open Sans', 'wght@400;600'], hf: 'sans-serif', bf: 'sans-serif' },
+  { id: 'sporty', mood: 'bold, sporty, energetic', h: ['Bebas Neue', ''], b: ['Roboto', 'wght@400;500;700'], hf: 'sans-serif', bf: 'sans-serif' },
+  { id: 'warm', mood: 'warm, homely', h: ['Lora', 'wght@500;700'], b: ['Nunito Sans', 'wght@400;700'], hf: 'serif', bf: 'sans-serif' },
+  { id: 'soft', mood: 'soft, calm, wellness', h: ['Fraunces', 'wght@500;700'], b: ['Manrope', 'wght@400;600'], hf: 'serif', bf: 'sans-serif' },
+  { id: 'minimal', mood: 'minimal, light', h: ['Outfit', 'wght@500;700'], b: ['Outfit', 'wght@300;400;500'], hf: 'sans-serif', bf: 'sans-serif' },
+  { id: 'luxury', mood: 'luxury, fashion', h: ['Cormorant Garamond', 'wght@500;700'], b: ['Jost', 'wght@400;500'], hf: 'serif', bf: 'sans-serif' },
+  { id: 'playful', mood: 'playful, kids, fun', h: ['Rubik', 'wght@500;700'], b: ['Rubik', 'wght@400;500'], hf: 'sans-serif', bf: 'sans-serif' },
+  { id: 'startup', mood: 'startup, product', h: ['Sora', 'wght@600;700'], b: ['Inter', 'wght@400;600'], hf: 'sans-serif', bf: 'sans-serif' },
+  { id: 'street', mood: 'streetwear, loud', h: ['Archivo Black', ''], b: ['Archivo', 'wght@400;600'], hf: 'sans-serif', bf: 'sans-serif' },
+  { id: 'trust', mood: 'trustworthy, professional', h: ['Merriweather', 'wght@700'], b: ['Source Sans 3', 'wght@400;600'], hf: 'serif', bf: 'sans-serif' },
+];
+const fontById = (id) => FONT_PAIRS.find((f) => f.id === id) || null;
+function fontCss(id) {
+  const f = fontById(id);
+  if (!f) return { imports: '', rules: '' };
+  const fam = (x) => 'family=' + x[0].replace(/ /g, '+') + (x[1] ? ':' + x[1] : '');
+  const fams = f.h[0] === f.b[0] ? [fam([f.h[0], f.b[1] || f.h[1]])] : [fam(f.h), fam(f.b)];
+  return {
+    imports: '@import url("https://fonts.googleapis.com/css2?' + fams.join('&') + '&display=swap");\n',
+    rules: '\n/* font pair */\nbody,input,button,select,textarea{font-family:"' + f.b[0] + '",' + f.bf + '!important}\nh1,h2,h3,h4,h5,h6{font-family:"' + f.h[0] + '",' + f.hf + '!important}',
+  };
+}
+const lum = (hex) => {
+  let h = hex.replace('#', '');
+  if (h.length === 3) h = h.split('').map((c) => c + c).join('');
+  const v = [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16) / 255).map((c) => (c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4)));
+  return 0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2];
+};
+const contrast = (a, b) => { const x = lum(a), y = lum(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05); };
+const toHex = (r, g, b) => '#' + [r, g, b].map((x) => Math.max(0, Math.min(255, Math.round(x))).toString(16).padStart(2, '0')).join('');
+const rgb = (hex) => { let h = hex.replace('#', ''); if (h.length === 3) h = h.split('').map((c) => c + c).join(''); return [0, 2, 4].map((i) => parseInt(h.slice(i, i + 2), 16)); };
+const shade = (hex, f) => toHex(...rgb(hex).map((x) => x * f));                 // f < 1 darkens
+const tint = (hex, f) => toHex(...rgb(hex).map((x) => x + (255 - x) * f));      // f > 0 lightens
+// A new palette must stay readable. 1) background and text variables must keep strong contrast, otherwise both are reverted.
+// 2) Every other colour keeps its role: a colour that carries white text (buttons, hero) stays dark enough for it, a light tint or surface stays light.
+function guardVars(tpl, vars) {
+  const orig = rootVars(tpl), all = { ...orig, ...vars }, names = Object.keys(all);
+  const isBg = (n) => /^--(bg|background|paper|bone|canvas)(?![\w-])/i.test(n), isTx = (n) => /^--(tx|text|fg|foreground)(?![\w-])/i.test(n);
+  const bg = names.find(isBg), tx = names.find(isTx);
+  if (bg && tx && contrast(all[bg], all[tx]) < 4.5) { delete vars[bg]; delete vars[tx]; }
+  for (const [n, v] of Object.entries(vars)) {
+    if (isBg(n) || isTx(n) || !orig[n]) continue;
+    const co = contrast(orig[n], '#ffffff');
+    let nv = v, guard = 0;
+    if (co >= 3) while (contrast(nv, '#ffffff') < 3.5 && guard++ < 14) nv = shade(nv, 0.88);
+    else if (co < 1.6) while (contrast(nv, '#ffffff') >= 3 && guard++ < 14) nv = tint(nv, 0.25);
+    vars[n] = nv;
+  }
+  return vars;
 }
 
 // texts: { "<group id>": ["new text for item 0", "new text for item 1", ...] } -> { html, css, javascript }
@@ -149,8 +206,9 @@ function applyTexts(tpl, texts, opt = {}) {
     try { new Function(js); } catch (e) { js = orig; } // syntax check only; if something went wrong keep the template script
   }
   const vars = cleanVars(tpl, opt.vars);
-  const css = tpl.css + (Object.keys(vars).length ? '\n/* customised colours */\n:root{' + Object.entries(vars).map(([k, v]) => k + ':' + v).join(';') + '}' : '');
+  const fc = fontCss(opt.font || (opt.vars && opt.vars['--font']));
+  const css = fc.imports + tpl.css + (Object.keys(vars).length ? '\n/* customised colours */\n:root{' + Object.entries(vars).map(([k, v]) => k + ':' + v).join(';') + '}' : '') + fc.rules;
   return { html, css, javascript: js };
 }
 
-module.exports = { slotInfo, applyTexts, rootVars, cleanVars, themeOf, buildSlots };
+module.exports = { slotInfo, applyTexts, rootVars, cleanVars, themeOf, buildSlots, FONT_PAIRS, fontById };
