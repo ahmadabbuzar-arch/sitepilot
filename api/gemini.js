@@ -32,7 +32,16 @@ const tc = require('./_tplcopy.js'); // text-slot engine: backup AIs customise t
 // generate mode: the AI first picks the closest of the 100 templates, then rewrites its content for the user's request
 // (the template's layout, CSS and JavaScript are kept). If anything here fails, the normal from-scratch generation runs.
 let tplData = null; // loaded on first use: one file with all 100 templates (api/_templates.js)
-const tplAll = () => { if (!tplData) { try { tplData = require('./_templates.js'); } catch (e) { tplData = { catalog: [], templates: {} }; } } return tplData; };
+const tplAll = () => {
+  if (!tplData) {
+    const a = { catalog: [], templates: {} };
+    // literal require() paths on purpose: Vercel only bundles files it can see in the code
+    try { const m = require('./_templates.js'); a.catalog.push(...m.catalog); Object.assign(a.templates, m.templates); } catch (e) { /* missing: that set is simply not offered */ }
+    try { const m = require('./_templates2.js'); a.catalog.push(...m.catalog); Object.assign(a.templates, m.templates); } catch (e) { /* missing: that set is simply not offered */ }
+    tplData = a;
+  }
+  return tplData;
+};
 const templateCatalog = () => tplAll().catalog;
 const loadTemplate = (id) => (typeof id === 'string' && Object.prototype.hasOwnProperty.call(tplAll().templates, id) ? tplAll().templates[id] : null);
 // Fallback when the AI pick fails (or for English prompts it is enough): count template names/tags found in the request.
