@@ -97,10 +97,17 @@ function slotInfo(tpl) {
 
 // CSS colour variables of the template (name -> current value), so the AI can recolour it when the user asks for it
 function rootVars(tpl) {
-  const m = (tpl.css || '').match(/:root\s*\{([^}]*)\}/);
   const out = {};
-  if (m) for (const x of m[1].matchAll(/(--[\w-]+)\s*:\s*(#[0-9a-fA-F]{3,8})\s*(?:;|$)/g)) out[x[1]] = x[2];
+  for (const m of (tpl.css || '').matchAll(/:root\s*\{([^}]*)\}/g)) for (const x of m[1].matchAll(/(--[\w-]+)\s*:\s*(#[0-9a-fA-F]{3}|#[0-9a-fA-F]{6})\s*(?:;|$)/g)) out[x[1]] = x[2];
   return out;
+}
+// images and shared libraries (Bootstrap ...) of the added templates live in api/_tplres.js and are put back when the site is built
+let tplRes = null;
+function expandRes(s) {
+  if (!/__SP(IMG|LIB)_/.test(s)) return s;
+  if (!tplRes) { try { tplRes = require('./_tplres.js'); } catch (e) { tplRes = { img: {}, lib: {} }; } }
+  for (let i = 0; i < 3 && /__SPLIB_/.test(s); i++) s = s.replace(/\/\*__SPLIB_([0-9a-f]{10})__\*\//g, (m, k) => tplRes.lib[k] || '');
+  return s.replace(/__SPIMG_([0-9a-f]{10})__/g, (m, k) => tplRes.img[k] || 'data:,');
 }
 function cleanVars(tpl, vars) {
   const allowed = rootVars(tpl), out = {};
@@ -191,7 +198,7 @@ function applyTexts(tpl, texts, opt = {}) {
   let html = parts.join('');
   const assets = (Array.isArray(opt.assets) ? opt.assets : []).filter((a) => /^assets\/[a-z0-9._-]{1,70}$/.test(a));
   if (assets.length) { // the visitor's own photos replace the first stock photos of the template
-    const urls = [...new Set(html.match(/https:\/\/images\.unsplash\.com\/[^"'\s)]+/g) || [])];
+    const urls = [...new Set([...html.matchAll(/<img\b[^>]*?\ssrc="(https:\/\/images\.unsplash\.com\/[^"]+|__SPIMG_[0-9a-f]{10}__)"/g)].map((m) => m[1]))];
     urls.slice(0, assets.length).forEach((u, i) => { html = html.split(u).join(assets[i]); });
   }
   let js = tpl.javascript || '';
@@ -208,7 +215,7 @@ function applyTexts(tpl, texts, opt = {}) {
   const vars = cleanVars(tpl, opt.vars);
   const fc = fontCss(opt.font || (opt.vars && opt.vars['--font']));
   const css = fc.imports + tpl.css + (Object.keys(vars).length ? '\n/* customised colours */\n:root{' + Object.entries(vars).map(([k, v]) => k + ':' + v).join(';') + '}' : '') + fc.rules;
-  return { html, css, javascript: js };
+  return { html: expandRes(html), css: expandRes(css), javascript: expandRes(js) };
 }
 
 module.exports = { slotInfo, applyTexts, rootVars, cleanVars, themeOf, buildSlots, FONT_PAIRS, fontById };
